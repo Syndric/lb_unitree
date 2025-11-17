@@ -5,7 +5,7 @@
  * real-time GUI dashboard for monitoring power and battery stats.
  *
  * It uses Dear ImGui for the GUI, GLFW for the window,
- * and OpenGL for rendering.
+ * OpenGL for rendering, and ImPlot for plotting.
  *
  * It now uses the SDK's LoopFunc class for communication,
  * matching the structure of the working terminal monitor.
@@ -15,7 +15,7 @@
 #include <iostream>
 #include <unistd.h>
 #include <string.h>
-// #include <thread>        // No longer using std::thread for comms
+// #include <thread>     // No longer using std::thread for comms
 #include <mutex>   // For thread-safe data access
 #include <chrono>  // For time calculations
 #include <vector>  // For plot history
@@ -28,6 +28,9 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+
+// --- ImPlot Header ---
+#include "implot.h"
 
 // --- GLFW / OpenGL Headers ---
 #include <stdio.h>
@@ -62,7 +65,7 @@ struct MonitorData
     double averagePower_W = 0.0;
     double runTime_s = 0.0;
 
-    // Plotting History
+    // Plotting History (using 500 samples for better ImPlot resolution)
     std::vector<float> socHistory;
     std::vector<float> powerHistory;
     std::vector<float> voltageHistory;
@@ -79,7 +82,8 @@ public:
                      loop_count(0),
                      loop_udpSend(nullptr),
                      loop_udpRecv(nullptr),
-                     loop_control(nullptr)
+                     loop_control(nullptr),
+                     plotHistorySize(500) // Store 500 samples (1 second at 500Hz)
     {
         udp.InitCmdData(cmd);
         cmd.mode = 0; // Set to idle mode for safety
@@ -210,7 +214,7 @@ public:
 
         // --- Calculations ---
         float voltage = std::accumulate(state.bms.cell_vol.begin(), state.bms.cell_vol.end(), 0) / 1000.0f; // mV to V
-        float current = state.bms.current / 1000.0f;                                                        // mA to A
+        float current = state.bms.current / 1000.0f;                                                       // mA to A
         float power = voltage * current;
 
         double runTime = std::chrono::duration<double>(now - startTime).count();
@@ -222,7 +226,7 @@ public:
             currentTotalEnergy_Wh = data.totalEnergy_Wh;
         }
 
-        double energy_Ws = power * dt_actual;                                 // Energy in Watt-seconds (Joules)
+        double energy_Ws = power * dt_actual;                                     // Energy in Watt-seconds (Joules)
         double totalEnergy_Ws = (currentTotalEnergy_Wh * 3600.0) + energy_Ws; // Convert Wh back to Ws to add
 
         // --- Lock and Update Data ---
@@ -239,11 +243,11 @@ public:
             data.totalEnergy_Wh = totalEnergy_Ws / 3600.0; // Convert back to Wh
             data.averagePower_W = (runTime > 0) ? (totalEnergy_Ws / runTime) : 0.0;
 
-            // Update plot history (limit to 300 samples)
-            limit_data_vector(data.socHistory, 300);
-            limit_data_vector(data.powerHistory, 300);
-            limit_data_vector(data.voltageHistory, 300);
-            limit_data_vector(data.currentHistory, 300);
+            // Update plot history (limit to plotHistorySize samples)
+            limit_data_vector(data.socHistory, plotHistorySize);
+            limit_data_vector(data.powerHistory, plotHistorySize);
+            limit_data_vector(data.voltageHistory, plotHistorySize);
+            limit_data_vector(data.currentHistory, plotHistorySize);
 
             data.socHistory.push_back(state.bms.SOC);
             data.powerHistory.push_back(power);
@@ -290,6 +294,7 @@ private:
     HighState state = {0};
     float dt;
     long long loop_count;
+    const size_t plotHistorySize;
 
     std::atomic<bool> running;
 
@@ -337,6 +342,7 @@ int main(int, char **)
     // --- 3. Initialize ImGui ---
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext(); // Create ImPlot context
     ImGuiIO &io = ImGui::GetIO();
     (void)io;
     ImGui::StyleColorsDark();
@@ -365,7 +371,7 @@ int main(int, char **)
         ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-        ImGui::Text("UNITREE GO1 POWER MONITOR");
+        ImGui::Text("UNITREE GO1 POWER MONITOR (ImPlot Version)");
         ImGui::Separator();
 
         // --- START/STOP BUTTONS ---
@@ -411,10 +417,10 @@ int main(int, char **)
             ImGui::BeginChild("Stats", ImVec2(ImGui::GetContentRegionAvail().x * 0.4f, 0), true);
             ImGui::Text("STATUS (Runtime: %.2f s)", displayData.runTime_s);
             ImGui::Separator();
-            ImGui::Text("SOC:         %d %%", (int)displayData.bms.SOC);
-            ImGui::Text("Voltage:     %.2f V", displayData.totalVoltage_V);
-            ImGui::Text("Current:     %.2f A", displayData.current_A);
-            ImGui::Text("Power:       %.2f W", displayData.power_W);
+            ImGui::Text("SOC:        %d %%", (int)displayData.bms.SOC);
+            ImGui::Text("Voltage:    %.2f V", displayData.totalVoltage_V);
+            ImGui::Text("Current:    %.2f A", displayData.current_A);
+            ImGui::Text("Power:      %.2f W", displayData.power_W);
             ImGui::Separator();
             ImGui::Text("Total Usage: %.4f Wh", displayData.totalEnergy_Wh);
             ImGui::Text("Avg. Power:  %.2f W", displayData.averagePower_W);
@@ -437,19 +443,14 @@ int main(int, char **)
 
             // --- Plots Window ---
             ImGui::BeginChild("Plots", ImVec2(0, 0), true);
-            ImGui::Text("REAL-TIME PLOTS (Last 300 samples)");
+            ImGui::Text("REAL-TIME PLOTS (Last %d samples)", (int)displayData.socHistory.size());
 
             if (!displayData.socHistory.empty())
             {
-                // 1. SOC, Voltage
-                ImGui::PlotLines("SOC (%)", displayData.socHistory.data(), displayData.socHistory.size(), 0, NULL, 0.0f, 100.0f, ImVec2(0, 100));
-                ImGui::PlotLines("Voltage (V)", displayData.voltageHistory.data(), displayData.voltageHistory.size(), 0, NULL, 18.0f, 26.0f, ImVec2(0, 100));
-
                 // --- Create temporary, inverted data for plotting ---
+                // (Usage/Discharge = Positive value)
                 std::vector<float> absPowerHistory(displayData.powerHistory.size());
                 std::vector<float> absCurrentHistory(displayData.currentHistory.size());
-
-                // Invert the signs (Usage/Discharge = Positive value)
                 for (size_t i = 0; i < displayData.powerHistory.size(); ++i)
                 {
                     absPowerHistory[i] = -displayData.powerHistory[i]; // E.g., -50W becomes 50W
@@ -459,9 +460,50 @@ int main(int, char **)
                     absCurrentHistory[i] = -displayData.currentHistory[i]; // E.g., -5A becomes 5A
                 }
 
-                // 2. Plot Inverted Data
-                ImGui::PlotLines("Power (W) - Usage", absPowerHistory.data(), absPowerHistory.size(), 0, NULL, 0.0f, 500.0f, ImVec2(0, 100));      // Min Y is now 0.0f
-                ImGui::PlotLines("Current (A) - Usage", absCurrentHistory.data(), absCurrentHistory.size(), 0, NULL, 0.0f, 20.0f, ImVec2(0, 100)); // Min Y is now 0.0f
+                // --- Plot 1: SOC & Voltage (Dual Y-Axis) ---
+                // Use ImVec2(-1, ...) to fill the width.
+                float plotHeight = (ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y) / 2.0f;
+
+                if (ImPlot::BeginPlot("SOC & Voltage", ImVec2(-1, plotHeight)))
+                {
+                    // --- Setup ALL axes first ---
+                    // Y-Axis 1 (Left) for SOC
+                    ImPlot::SetupAxis(ImAxis_Y1, "SOC (%)", ImPlotAxisFlags_None);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 100, ImPlotCond_Always);
+
+                    // Y-Axis 2 (Right) for Voltage
+                    ImPlot::SetupAxis(ImAxis_Y2, "Voltage (V)", ImPlotAxisFlags_Opposite);
+                    ImPlot::SetupAxisLimits(ImAxis_Y2, 18.0, 26.0, ImPlotCond_Always); // Go1 6S battery
+
+                    // --- Then plot data ---
+                    ImPlot::PlotLine("SOC", displayData.socHistory.data(), displayData.socHistory.size());
+
+                    ImPlot::SetAxis(ImAxis_Y2); // Activate Y2
+                    ImPlot::PlotLine("Voltage", displayData.voltageHistory.data(), displayData.voltageHistory.size());
+
+                    ImPlot::EndPlot();
+                }
+
+                // --- Plot 2: Power & Current (Dual Y-Axis) ---
+                if (ImPlot::BeginPlot("Power & Current (Usage)", ImVec2(-1, plotHeight)))
+                {
+                    // --- Setup ALL axes first ---
+                    // Y-Axis 1 (Left) for Power
+                    ImPlot::SetupAxis(ImAxis_Y1, "Power (W)", ImPlotAxisFlags_None);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 500, ImPlotCond_Always); // 0 to 500W
+
+                    // Y-Axis 2 (Right) for Current
+                    ImPlot::SetupAxis(ImAxis_Y2, "Current (A)", ImPlotAxisFlags_Opposite);
+                    ImPlot::SetupAxisLimits(ImAxis_Y2, 0, 20, ImPlotCond_Always); // 0 to 20A
+
+                    // --- Then plot data ---
+                    ImPlot::PlotLine("Power", absPowerHistory.data(), absPowerHistory.size());
+
+                    ImPlot::SetAxis(ImAxis_Y2); // Activate Y2
+                    ImPlot::PlotLine("Current", absCurrentHistory.data(), absCurrentHistory.size());
+
+                    ImPlot::EndPlot();
+                }
             }
 
             ImGui::EndChild(); // End Plots
@@ -488,6 +530,7 @@ int main(int, char **)
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
+    ImPlot::DestroyContext(); // Destroy ImPlot context
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);

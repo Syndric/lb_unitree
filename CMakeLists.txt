@@ -76,14 +76,26 @@ set(IMGUI_SOURCES
   ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-# --- 3. Add ImGui include directory ---
+# --- 3. Define ImPlot source files ---
+# This assumes you have an 'implot' directory alongside your 'imgui' dir
+# containing the ImPlot source files.
+set(IMPLOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/implot")
+set(IMPLOT_SOURCES
+  ${IMPLOT_DIR}/implot.cpp
+  ${IMPLOT_DIR}/implot_items.cpp
+  ${IMPLOT_DIR}/implot_demo.cpp
+)
+
+# --- 4. Add ImGui and ImPlot include directories ---
 include_directories(${IMGUI_DIR})
 include_directories(${IMGUI_DIR}/backends)
+include_directories(${IMPLOT_DIR})
 
-# --- 4. Add the executable ---
-add_executable(monitor_gui src/monitor_gui.cpp ${IMGUI_SOURCES})
+# --- 5. Add the executable ---
+# We add both ImGui and ImPlot sources to the executable
+add_executable(monitor_gui src/monitor_gui.cpp ${IMGUI_SOURCES} ${IMPLOT_SOURCES})
 
-# --- 5. Link all libraries ---
+# --- 6. Link all libraries ---
 target_link_libraries(monitor_gui
   ${EXTRA_LIBS}     # unitree_legged_sdk and pthread
   glfw              # The windowing library
