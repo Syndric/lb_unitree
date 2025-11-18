@@ -23,6 +23,8 @@
 #include <fstream> // For CSV logging
 #include <iomanip> // For std::setprecision
 #include <atomic>  // For std::atomic<bool>
+#include <array>   // For std::array (to hold joint torques)
+#include <algorithm> // For std::max
 
 // --- ImGui & Backend Headers ---
 #include "imgui.h"
@@ -65,11 +67,15 @@ struct MonitorData
     double averagePower_W = 0.0;
     double runTime_s = 0.0;
 
+    // Joint Torques
+    std::array<float, 12> jointTorques;
+
     // Plotting History (using 500 samples for better ImPlot resolution)
     std::vector<float> socHistory;
     std::vector<float> powerHistory;
     std::vector<float> voltageHistory;
     std::vector<float> currentHistory;
+    std::array<std::vector<float>, 12> jointTorqueHistory;
 };
 
 class RobotMonitor
@@ -110,10 +116,15 @@ public:
             data.totalEnergy_Wh = 0.0;
             data.averagePower_W = 0.0;
             data.runTime_s = 0.0;
+            data.jointTorques.fill(0.0f); // Explicitly zero the torques
             data.socHistory.clear();
             data.powerHistory.clear();
             data.voltageHistory.clear();
             data.currentHistory.clear();
+            for (auto &vec : data.jointTorqueHistory)
+            {
+                vec.clear();
+            }
         }
 
         // Open log file and write header
@@ -139,7 +150,8 @@ public:
         // --- Use LoopFunc, just like monitor.cpp ---
         loop_udpSend = new LoopFunc("udp_send", dt, 3, boost::bind(&RobotMonitor::UDPSend, this));
         loop_udpRecv = new LoopFunc("udp_recv", dt, 3, boost::bind(&RobotMonitor::UDPRecv, this));
-        loop_control = new LoopFunc("control_loop", dt, boost::bind(&RobotMonitor::RunMonitorLoop, this));
+        // Give the control loop high priority as well to ensure 500Hz execution
+        loop_control = new LoopFunc("control_loop", dt, 3, boost::bind(&RobotMonitor::RunMonitorLoop, this));
 
         loop_udpSend->start();
         loop_udpRecv->start();
@@ -239,6 +251,12 @@ public:
             data.power_W = power;
             data.runTime_s = runTime;
 
+            // Copy joint torques
+            for (int i = 0; i < 12; ++i)
+            {
+                data.jointTorques[i] = state.motorState[i].tauEst;
+            }
+
             // Update totals
             data.totalEnergy_Wh = totalEnergy_Ws / 3600.0; // Convert back to Wh
             data.averagePower_W = (runTime > 0) ? (totalEnergy_Ws / runTime) : 0.0;
@@ -253,6 +271,13 @@ public:
             data.powerHistory.push_back(power);
             data.voltageHistory.push_back(voltage);
             data.currentHistory.push_back(current);
+
+            // Update joint torque history
+            for (int i = 0; i < 12; ++i)
+            {
+                limit_data_vector(data.jointTorqueHistory[i], plotHistorySize);
+                data.jointTorqueHistory[i].push_back(data.jointTorques[i]);
+            }
         }
 
         loop_count++;
@@ -353,6 +378,13 @@ int main(int, char **)
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
+    // Joint names for display
+    const char *jointNames[12] = {
+        "FR_Hip  ", "FR_Thigh", "FR_Calf ",
+        "FL_Hip  ", "FL_Thigh", "FL_Calf ",
+        "RR_Hip  ", "RR_Thigh", "RR_Calf ",
+        "RL_Hip  ", "RL_Thigh", "RL_Calf "};
+
     // --- 4. Main GUI Loop ---
     while (!glfwWindowShouldClose(window))
     {
@@ -418,25 +450,26 @@ int main(int, char **)
             ImGui::Text("STATUS (Runtime: %.2f s)", displayData.runTime_s);
             ImGui::Separator();
             ImGui::Text("SOC:        %d %%", (int)displayData.bms.SOC);
-            ImGui::Text("Voltage:    %.2f V", displayData.totalVoltage_V);
-            ImGui::Text("Current:    %.2f A", displayData.current_A);
-            ImGui::Text("Power:      %.2f W", displayData.power_W);
-            ImGui::Separator();
-            ImGui::Text("Total Usage: %.4f Wh", displayData.totalEnergy_Wh);
-            ImGui::Text("Avg. Power:  %.2f W", displayData.averagePower_W);
-            ImGui::Text("Cycles:      %d", displayData.bms.cycle);
-            ImGui::Separator();
-            ImGui::Text("LOGGING: Writing to 'go1_bms_log.csv' at ~10Hz.");
-            ImGui::Text("This log contains SOC vs. mV data for all cells.");
-
-            ImGui::Separator();
-            ImGui::Text("Cell Voltages (mV):");
-            ImGui::BeginChild("Cells", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("Cells", ImVec2(0, 150), false, ImGuiWindowFlags_HorizontalScrollbar); // Give cells a fixed height
             for (int i = 0; i < 10; i++)
             {
                 ImGui::Text("Cell %2d: %d mV", i + 1, displayData.bms.cell_vol[i]);
             }
-            ImGui::EndChild();
+            ImGui::EndChild(); // End Cells
+
+            ImGui::Separator();
+            ImGui::Text("Joint Torques (Est. Nm):");
+            ImGui::BeginChild("Torques", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false, ImGuiWindowFlags_HorizontalScrollbar);
+            for (int i = 0; i < 12; i++)
+            {
+                // Display in a 3-column layout for readability
+                if (i % 3 != 0)
+                    ImGui::SameLine(150.0f * (i % 3));
+
+                ImGui::Text("%s: %5.2f", jointNames[i], displayData.jointTorques[i]);
+            }
+            ImGui::EndChild(); // End Torques
+
             ImGui::EndChild(); // End Stats
 
             ImGui::SameLine();
@@ -462,7 +495,9 @@ int main(int, char **)
 
                 // --- Plot 1: SOC & Voltage (Dual Y-Axis) ---
                 // Use ImVec2(-1, ...) to fill the width.
-                float plotHeight = (ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y) / 2.0f;
+                // Calculate height for 3 plots
+                float plotHeight = (ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y * 2.0f) / 3.0f;
+                plotHeight = std::max(plotHeight, 50.0f); // Ensure a minimum height
 
                 if (ImPlot::BeginPlot("SOC & Voltage", ImVec2(-1, plotHeight)))
                 {
@@ -502,6 +537,24 @@ int main(int, char **)
                     ImPlot::SetAxis(ImAxis_Y2); // Activate Y2
                     ImPlot::PlotLine("Current", absCurrentHistory.data(), absCurrentHistory.size());
 
+                    ImPlot::EndPlot();
+                }
+
+                // --- Plot 3: Joint Torques ---
+                if (ImPlot::BeginPlot("Joint Torques (Est. Nm)", ImVec2(-1, plotHeight)))
+                {
+                    ImPlot::SetupLegend(ImPlotLocation_East, ImPlotLegendFlags_Outside); // Add a legend
+                    ImPlot::SetupAxis(ImAxis_Y1, "Torque (Nm)", ImPlotAxisFlags_None);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, -30, 30, ImPlotCond_Always); // Typical Go1 torque limits
+
+                    for (int i = 0; i < 12; ++i)
+                    {
+                        // Check if history has data to avoid plotting empty vectors
+                        if (!displayData.jointTorqueHistory[i].empty())
+                        {
+                            ImPlot::PlotLine(jointNames[i], displayData.jointTorqueHistory[i].data(), displayData.jointTorqueHistory[i].size());
+                        }
+                    }
                     ImPlot::EndPlot();
                 }
             }
