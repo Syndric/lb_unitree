@@ -47,7 +47,8 @@ void limit_data_vector(std::vector<float> &vec, size_t max_size)
 // Enum for Test Modes
 enum class TestMode {
     NONE,
-    NEUTRAL_FLOOR,
+    NEUTRAL,
+    FLOOR,
     SQUAT_REAR_DOWN,
     WALK_TURN
 };
@@ -85,7 +86,7 @@ class RobotMonitor
 {
 public:
     RobotMonitor() : safe(LeggedType::Go1),
-                     udp(HIGHLEVEL, 8090, "192.168.123.161", 8082), // Targeted Go1 IP
+                     udp(HIGHLEVEL, 8090, "192.168.12.1", 8082), // Targeted Go1 IP
                      running(false),
                      dt(0.002), // 500Hz
                      loop_count(0),
@@ -275,27 +276,22 @@ public:
                 // Execute Test Logic
                 switch (activeTest)
                 {
-                case TestMode::NEUTRAL_FLOOR:
+                case TestMode::NEUTRAL:
                     // Test 1: Neutral / Damping on floor
                     cmd.mode = 0; // Idle/Damping
+                    break;
+
+                case TestMode::FLOOR:
+                    // Test 1: Neutral / Damping on floor
+                    cmd.mode = 1; // Forced Stand
+                    cmd.bodyHeight = -0.4;
                     break;
 
                 case TestMode::SQUAT_REAR_DOWN:
                     // Test 2: Standing then squatting rear to floor
                     cmd.mode = 1; // Forced Stand
-                    
-                    // Smooth entry over 5 seconds
-                    if (testElapsedTime < 5.0) {
-                        float ratio = testElapsedTime / 5.0f;
-                        // Ramp body height down to -0.15m
-                        cmd.bodyHeight = 0.0f + ratio * (-0.15f - 0.0f);
-                        // Ramp pitch UP (Negative value is nose up/rear down)
-                        cmd.euler[1] = 0.0f + ratio * (-0.4f - 0.0f); 
-                    } else {
-                        // Hold position
-                        cmd.bodyHeight = -0.15f; 
-                        cmd.euler[1] = -0.4f; // Rear down
-                    }
+                    cmd.bodyHeight = -0.4;
+                    cmd.euler[1] = -0.7;
                     break;
 
                 case TestMode::WALK_TURN:
@@ -534,8 +530,11 @@ int main(int, char **)
             ImGui::Text("AUTOMATED TESTS (120s Duration)");
             if (displayData.currentTest == TestMode::NONE)
             {
-                if (ImGui::Button("Test 1: Neutral (Floor)", ImVec2(180, 40))) {
-                    monitor.StartTest(TestMode::NEUTRAL_FLOOR);
+                if (ImGui::Button("Test 0: Neutral", ImVec2(180, 40))) {
+                    monitor.StartTest(TestMode::NEUTRAL);
+                }
+                if (ImGui::Button("Test 1: Floor", ImVec2(180, 40))) {
+                    monitor.StartTest(TestMode::FLOOR);
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Test 2: Squat (Rear Down)", ImVec2(180, 40))) {
@@ -580,6 +579,7 @@ int main(int, char **)
             
             ImGui::Text("STATUS");
             ImGui::Text("Runtime:      %.2f s", displayData.runTime_s);
+            ImGui::Text("Amperage:     %.4f A", (displayData.bms.current / 1000.0f));
             ImGui::Text("Total Energy: %.4f Wh", displayData.totalEnergy_Wh);
             
             ImGui::Separator();
