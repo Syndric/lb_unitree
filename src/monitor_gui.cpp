@@ -7,14 +7,14 @@
 #include <iostream>
 #include <unistd.h>
 #include <string.h>
-#include <mutex>   // For thread-safe data access
-#include <chrono>  // For time calculations
-#include <vector>  // For plot history
-#include <numeric> // For std::accumulate
-#include <fstream> // For CSV logging
-#include <iomanip> // For std::setprecision
-#include <atomic>  // For std::atomic<bool>
-#include <array>   // For std::array (to hold joint torques)
+#include <mutex>     // For thread-safe data access
+#include <chrono>    // For time calculations
+#include <vector>    // For plot history
+#include <numeric>   // For std::accumulate
+#include <fstream>   // For CSV logging
+#include <iomanip>   // For std::setprecision
+#include <atomic>    // For std::atomic<bool>
+#include <array>     // For std::array (to hold joint torques)
 #include <algorithm> // For std::max
 
 // --- ImGui & Backend Headers ---
@@ -45,7 +45,8 @@ void limit_data_vector(std::vector<float> &vec, size_t max_size)
 }
 
 // Enum for Test Modes
-enum class TestMode {
+enum class TestMode
+{
     NONE,
     NEUTRAL,
     FLOOR,
@@ -66,6 +67,8 @@ struct MonitorData
     double totalEnergy_Wh = 0.0;
     double averagePower_W = 0.0;
     double runTime_s = 0.0;
+    std::array<float, 3> position = {0.0f};
+    std::array<float, 3> rpy = {0.0f};
 
     // Joint Torques
     std::array<float, 12> jointTorques;
@@ -123,7 +126,7 @@ public:
             data.totalEnergy_Wh = 0.0;
             data.averagePower_W = 0.0;
             data.runTime_s = 0.0;
-            data.jointTorques.fill(0.0f); 
+            data.jointTorques.fill(0.0f);
             data.socHistory.clear();
             data.powerHistory.clear();
             data.voltageHistory.clear();
@@ -134,6 +137,8 @@ public:
             }
             data.currentTest = TestMode::NONE;
             data.testTimeRemaining = 0.0;
+            data.position.fill(0.0f);
+            data.rpy.fill(0.0f);
         }
 
         // Open log file and write header using buffer name
@@ -142,10 +147,11 @@ public:
         {
             // Write Standard Headers
             logFile << "Timestamp(ms),Runtime(s),TestMode,SOC(%),Voltage(V),Current(A),Power(W),TotalEnergy(Wh),";
-            
+
             // Write Torque Headers
-            const char* logJointNames[12] = {"FR_Hip","FR_Thigh","FR_Calf","FL_Hip","FL_Thigh","FL_Calf","RR_Hip","RR_Thigh","RR_Calf","RL_Hip","RL_Thigh","RL_Calf"};
-            for(int i=0; i<12; ++i) {
+            const char *logJointNames[12] = {"FR_Hip", "FR_Thigh", "FR_Calf", "FL_Hip", "FL_Thigh", "FL_Calf", "RR_Hip", "RR_Thigh", "RR_Calf", "RL_Hip", "RL_Thigh", "RL_Calf"};
+            for (int i = 0; i < 12; ++i)
+            {
                 logFile << logJointNames[i] << "_Tau(Nm),";
             }
 
@@ -182,9 +188,21 @@ public:
         running = false;
 
         // Stop and delete LoopFunc objects
-        if (loop_udpSend) { delete loop_udpSend; loop_udpSend = nullptr; }
-        if (loop_udpRecv) { delete loop_udpRecv; loop_udpRecv = nullptr; }
-        if (loop_control) { delete loop_control; loop_control = nullptr; }
+        if (loop_udpSend)
+        {
+            delete loop_udpSend;
+            loop_udpSend = nullptr;
+        }
+        if (loop_udpRecv)
+        {
+            delete loop_udpRecv;
+            loop_udpRecv = nullptr;
+        }
+        if (loop_control)
+        {
+            delete loop_control;
+            loop_control = nullptr;
+        }
 
         if (logFile.is_open())
         {
@@ -206,7 +224,7 @@ public:
         return running.load();
     }
 
-    char* GetFilenameBuffer() { return logFilenameBuffer; }
+    char *GetFilenameBuffer() { return logFilenameBuffer; }
 
     // --- LoopFunc Callbacks ---
 
@@ -223,19 +241,21 @@ public:
 
     void RunMonitorLoop()
     {
-        if (!running) return;
+        if (!running)
+            return;
 
         udp.GetRecv(state);
         auto now = std::chrono::high_resolution_clock::now();
         double dt_actual = std::chrono::duration<double>(now - lastUpdateTime).count();
 
-        if (dt_actual < 0.001) return; // Avoid spikes
+        if (dt_actual < 0.001)
+            return; // Avoid spikes
 
         lastUpdateTime = now;
 
         // --- Power Calculations ---
         float voltage = std::accumulate(state.bms.cell_vol.begin(), state.bms.cell_vol.end(), 0) / 1000.0f; // mV to V
-        float current = state.bms.current / 1000.0f; // mA to A
+        float current = state.bms.current / 1000.0f;                                                        // mA to A
         float power = voltage * current;
 
         double runTime = std::chrono::duration<double>(now - startTime).count();
@@ -247,11 +267,11 @@ public:
             currentTotalEnergy_Wh = data.totalEnergy_Wh;
         }
 
-        double energy_Ws = power * dt_actual; // Energy in Watt-seconds (Joules)
+        double energy_Ws = power * dt_actual;                                 // Energy in Watt-seconds (Joules)
         double totalEnergy_Ws = (currentTotalEnergy_Wh * 3600.0) + energy_Ws; // Convert Wh back to Ws to add
 
         // --- Test Logic & Robot Control ---
-        
+
         // Reset command defaults
         cmd.mode = 0;
         cmd.gaitType = 0;
@@ -267,11 +287,12 @@ public:
             testElapsedTime += dt_actual;
 
             // Check Test Duration (120 seconds)
-            if (testElapsedTime >= 120.0) {
+            if (testElapsedTime >= 120.0)
+            {
                 activeTest = TestMode::NONE;
                 std::cout << "Test Completed." << std::endl;
             }
-            else 
+            else
             {
                 // Execute Test Logic
                 switch (activeTest)
@@ -295,30 +316,201 @@ public:
                     break;
 
                 case TestMode::WALK_TURN:
-                    // Test 3: Walk forward 0.5m/s, turn 180 deg, repeat
-                    cmd.mode = 2; // Walk
-                    cmd.gaitType = 1; // Trot
-                    
-                    // Cycle logic
-                    // Walk straight for 5 seconds
-                    // Turn 180 degrees (approx 3.2 sec at 1 rad/s)
-                    double cycleTime = fmod(testElapsedTime, 10.0);
+                    // 1. Define a variable to hold the initial heading
+                    static float startYaw = 0.0f;
+                    static float targetYaw = 0.0f;
+                    static bool turnInitialized = false;
 
-                    if (cycleTime < 5.0) {
-                        cmd.velocity[0] = 0.5f; // Walk forward
-                        cmd.yawSpeed = 0.0f;
-                    } 
-                    else if (cycleTime < 8.2) {
-                        cmd.velocity[0] = 0.0f;
-                        cmd.yawSpeed = 1.0f; // ~57 deg/s. 3.14s = 180 deg
+                    // LATCH LOGIC:
+                    // If this is the first time running this case, save the current yaw.
+                    // Note: You must ensure 'turnInitialized' is reset to false
+                    // externally if you switch modes and come back.
+                    if (!turnInitialized)
+                    {
+                        startYaw = data.rpy[2];
+                        turnInitialized = true;
                     }
-                    else {
-                        // Slight pause before next cycle
+
+                    // P-Gain: How "snappy" the turn is.
+                    float Kp = 2.0f;
+
+                    double cycleTime = fmod(testElapsedTime, 15.0);
+
+                    // --- PHASE 1: Turn to Start Angle (0.0s - 2.5s) ---
+                    if (cycleTime < 2.5)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
                         cmd.velocity[0] = 0.0f;
+
+                        // TARGET: The angle we latched at the start
+                        targetYaw = startYaw;
+                        float currentYaw = data.rpy[2];
+
+                        float error = targetYaw - currentYaw;
+
+                        // WRAPPING LOGIC
+                        if (error > M_PI)
+                            error -= 2 * M_PI;
+                        else if (error < -M_PI)
+                            error += 2 * M_PI;
+
+                        float turnSpeed = error * Kp;
+
+                        // Clamp speed
+                        if (turnSpeed > 3.5f)
+                            turnSpeed = 3.5f;
+                        if (turnSpeed < -3.5f)
+                            turnSpeed = -3.5f;
+
+                        cmd.yawSpeed = turnSpeed;
+                    }
+                    // --- PHASE 2: Walk Forward (2.5s - 7.5s) ---
+                    else if (cycleTime < 7.5)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 1.5f;
+                        cmd.yawSpeed = 0.0f;
+                    }
+                    // --- PHASE 3: Turn 180 deg from Start (7.5s - 10.0s) ---
+                    else if (cycleTime < 10)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 0.0f;
+
+                        // TARGET: Start angle + 180 degrees (PI)
+                        targetYaw = startYaw + (float)M_PI;
+
+                        // Normalize targetYaw to keep it within -PI to PI (optional but good practice)
+                        if (targetYaw > M_PI)
+                            targetYaw -= 2 * M_PI;
+                        else if (targetYaw < -M_PI)
+                            targetYaw += 2 * M_PI;
+
+                        float currentYaw = data.rpy[2];
+                        float error = targetYaw - currentYaw;
+
+                        // WRAPPING LOGIC
+                        if (error > M_PI)
+                            error -= 2 * M_PI;
+                        else if (error < -M_PI)
+                            error += 2 * M_PI;
+
+                        float turnSpeed = error * Kp;
+                        if (turnSpeed > 3.5f)
+                            turnSpeed = 3.5f;
+                        if (turnSpeed < -3.5f)
+                            turnSpeed = -3.5f;
+
+                        cmd.yawSpeed = turnSpeed;
+                    }
+                    // --- PHASE 4: Walk "Forward" (relative to robot nose) (10.0s - 15.0s) ---
+                    else
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 1.5f;
                         cmd.yawSpeed = 0.0f;
                     }
                     break;
                 }
+
+                /*
+                case TestMode::WALK_TURN:
+    cmd.mode = 3; // Target Position Walking
+    cmd.gaitType = 1; // Trot
+
+    // Zero out velocity/yawSpeed to ensure we are purely in Position Mode
+    cmd.velocity[0] = 0.0f;
+    cmd.velocity[1] = 0.0f;
+    cmd.yawSpeed = 0.0f;
+
+    // Define constants
+    const float PI = 3.14159265f;
+    const float WALK_DIST = 2.5f;    // 0.5m/s * 5.0s = 2.5m
+    const float TURN_DURATION = 3.2f;
+    const float CYCLE_DURATION = 10.0f;
+
+    // Calculate cycle state
+    // cycleCount determines if we are going Away (Even) or Returning (Odd)
+    int cycleCount = (int)(testElapsedTime / CYCLE_DURATION);
+    double cycleTime = fmod(testElapsedTime, CYCLE_DURATION);
+
+    // Initialize target variables
+    float targetX = 0.0f;
+    float targetYaw = 0.0f;
+
+    // LOGIC:
+    // Even Cycle (0, 2, 4...): Walk from X=0 to X=2.5, then Turn from Yaw=0 to Yaw=PI
+    // Odd Cycle  (1, 3, 5...): Walk from X=2.5 to X=0, then Turn from Yaw=PI to Yaw=2PI (0)
+
+    if (cycleCount % 2 == 0) {
+        // --- OUTBOUND LEG ---
+        float startYaw = 0.0f;
+
+        if (cycleTime < 5.0) {
+            // Phase 1: Walking Forward (0 -> 2.5m)
+            float progress = cycleTime / 5.0f; // 0.0 to 1.0
+            targetX = 0.0f + (WALK_DIST * progress);
+            targetYaw = startYaw;
+        }
+        else if (cycleTime < (5.0 + TURN_DURATION)) {
+            // Phase 2: Turning 180 (0 -> PI)
+            // We stay at the final X position
+            targetX = WALK_DIST;
+
+            float turnTime = cycleTime - 5.0f;
+            float progress = turnTime / TURN_DURATION;
+            targetYaw = startYaw + (PI * progress);
+        }
+        else {
+            // Phase 3: Pause
+            targetX = WALK_DIST;
+            targetYaw = startYaw + PI;
+        }
+    }
+    else {
+        // --- RETURN LEG ---
+        // We start at X=2.5, Yaw=PI. We walk "Forward" relative to robot,
+        // which decreases X in inertial frame because we are facing backwards.
+
+        float startYaw = PI;
+
+        if (cycleTime < 5.0) {
+            // Phase 1: Walking "Home" (2.5m -> 0)
+            float progress = cycleTime / 5.0f;
+            targetX = WALK_DIST - (WALK_DIST * progress);
+            targetYaw = startYaw;
+        }
+        else if (cycleTime < (5.0 + TURN_DURATION)) {
+            // Phase 2: Turning 180 (PI -> 2PI)
+            targetX = 0.0f;
+
+            float turnTime = cycleTime - 5.0f;
+            float progress = turnTime / TURN_DURATION;
+            targetYaw = startYaw + (PI * progress);
+        }
+        else {
+            // Phase 3: Pause
+            targetX = 0.0f;
+            targetYaw = startYaw + PI; // effectively 2PI aka 0
+        }
+    }
+
+    // Apply Targets
+    cmd.position[0] = targetX;
+    cmd.position[1] = 0.0f; // Assuming straight line on X axis
+
+    // NOTE: The header comment says Mode 3 is "controlled by position + ypr[0]".
+    // Standard Unitree mapping is euler[2] for Yaw.
+    // If the robot does not rotate, try cmd.euler[0] due to the specific header comment.
+    cmd.euler[0] = 0.0f;
+    cmd.euler[1] = 0.0f;
+    cmd.euler[2] = targetYaw;
+
+    break;*/
             }
         }
 
@@ -332,7 +524,9 @@ public:
             data.power_W = power;
             data.runTime_s = runTime;
             data.currentTest = activeTest;
-            
+            data.position = state.position;
+            data.rpy = state.imu.rpy;
+
             if (activeTest != TestMode::NONE)
                 data.testTimeRemaining = 120.0 - testElapsedTime;
             else
@@ -368,7 +562,7 @@ public:
         }
 
         loop_count++;
-        
+
         // Log to file periodically (every 50 loops ~ 10Hz)
         if (loop_count % 50 == 0 && logFile.is_open())
         {
@@ -401,7 +595,7 @@ public:
     MonitorData GetDisplayData()
     {
         std::lock_guard<std::mutex> lock(dataMutex);
-        return data; 
+        return data;
     }
 
 private:
@@ -416,7 +610,7 @@ private:
     std::atomic<bool> running;
     TestMode activeTest;
     double testElapsedTime;
-    
+
     char logFilenameBuffer[128];
 
     MonitorData data;
@@ -455,11 +649,11 @@ int main(int, char **)
     if (window == NULL)
         return 1;
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); 
+    glfwSwapInterval(1);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImPlot::CreateContext(); 
+    ImPlot::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     (void)io;
     ImGui::StyleColorsDark();
@@ -495,8 +689,8 @@ int main(int, char **)
         // --- CONFIGURATION ---
         if (!monitor.IsRunning())
         {
-             ImGui::Text("Configuration:");
-             ImGui::InputText("Log Filename", monitor.GetFilenameBuffer(), 128);
+            ImGui::Text("Configuration:");
+            ImGui::InputText("Log Filename", monitor.GetFilenameBuffer(), 128);
         }
 
         // --- START/STOP BUTTONS ---
@@ -530,33 +724,38 @@ int main(int, char **)
             ImGui::Text("AUTOMATED TESTS (120s Duration)");
             if (displayData.currentTest == TestMode::NONE)
             {
-                if (ImGui::Button("Test 0: Neutral", ImVec2(180, 40))) {
+                if (ImGui::Button("Test 0: Neutral", ImVec2(180, 40)))
+                {
                     monitor.StartTest(TestMode::NEUTRAL);
                 }
-                if (ImGui::Button("Test 1: Floor", ImVec2(180, 40))) {
+                if (ImGui::Button("Test 1: Floor", ImVec2(180, 40)))
+                {
                     monitor.StartTest(TestMode::FLOOR);
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Test 2: Squat (Rear Down)", ImVec2(180, 40))) {
+                if (ImGui::Button("Test 2: Squat (Rear Down)", ImVec2(180, 40)))
+                {
                     monitor.StartTest(TestMode::SQUAT_REAR_DOWN);
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Test 3: Walk & Turn", ImVec2(180, 40))) {
+                if (ImGui::Button("Test 3: Walk & Turn", ImVec2(180, 40)))
+                {
                     monitor.StartTest(TestMode::WALK_TURN);
                 }
             }
             else
             {
                 // Show Progress
-                const char* testNames[] = { "None", "Neutral/Floor", "Squat", "Walk & Turn" };
+                const char *testNames[] = {"None", "Neutral/Floor", "Squat", "Walk & Turn"};
                 ImGui::TextColored(ImVec4(1, 1, 0, 1), "RUNNING TEST: %s", testNames[(int)displayData.currentTest]);
-                
+
                 float fraction = (float)((120.0 - displayData.testTimeRemaining) / 120.0);
                 char buf[32];
                 sprintf(buf, "%.1f s Remaining", displayData.testTimeRemaining);
                 ImGui::ProgressBar(fraction, ImVec2(-1, 0.0f), buf);
 
-                if (ImGui::Button("ABORT TEST", ImVec2(-1, 0))) {
+                if (ImGui::Button("ABORT TEST", ImVec2(-1, 0)))
+                {
                     monitor.StartTest(TestMode::NONE);
                 }
             }
@@ -569,19 +768,19 @@ int main(int, char **)
             ImGui::Text("Monitoring is stopped. Configure filename and press 'Start' to begin.");
         }
         else if (displayData.runTime_s < 0.5)
-        { 
+        {
             ImGui::Text("Connecting to robot... (Runtime: %.2f s)", displayData.runTime_s);
         }
         else
         {
             // --- Stats Window ---
             ImGui::BeginChild("Stats", ImVec2(ImGui::GetContentRegionAvail().x * 0.4f, 0), true);
-            
+
             ImGui::Text("STATUS");
             ImGui::Text("Runtime:      %.2f s", displayData.runTime_s);
             ImGui::Text("Amperage:     %.4f A", (displayData.bms.current / 1000.0f));
             ImGui::Text("Total Energy: %.4f Wh", displayData.totalEnergy_Wh);
-            
+
             ImGui::Separator();
             ImGui::Text("SOC:         %d %%", (int)displayData.bms.SOC);
             ImGui::BeginChild("Cells", ImVec2(0, 150), false, ImGuiWindowFlags_HorizontalScrollbar);
@@ -589,7 +788,7 @@ int main(int, char **)
             {
                 ImGui::Text("Cell %2d: %d mV", i + 1, displayData.bms.cell_vol[i]);
             }
-            ImGui::EndChild(); 
+            ImGui::EndChild();
 
             ImGui::Separator();
             ImGui::Text("Joint Torques (Est. Nm):");
@@ -601,7 +800,7 @@ int main(int, char **)
 
                 ImGui::Text("%s: %5.2f", jointNames[i], displayData.jointTorques[i]);
             }
-            ImGui::EndChild(); 
+            ImGui::EndChild();
 
             ImGui::EndChild(); // End Stats
 
@@ -617,11 +816,11 @@ int main(int, char **)
                 std::vector<float> absCurrentHistory(displayData.currentHistory.size());
                 for (size_t i = 0; i < displayData.powerHistory.size(); ++i)
                 {
-                    absPowerHistory[i] = -displayData.powerHistory[i]; 
+                    absPowerHistory[i] = -displayData.powerHistory[i];
                 }
                 for (size_t i = 0; i < displayData.currentHistory.size(); ++i)
                 {
-                    absCurrentHistory[i] = -displayData.currentHistory[i]; 
+                    absCurrentHistory[i] = -displayData.currentHistory[i];
                 }
 
                 // Calculate height for 3 plots
@@ -637,7 +836,7 @@ int main(int, char **)
                     ImPlot::SetupAxisLimits(ImAxis_Y2, 18.0, 26.0, ImPlotCond_Always);
 
                     ImPlot::PlotLine("SOC", displayData.socHistory.data(), displayData.socHistory.size());
-                    ImPlot::SetAxis(ImAxis_Y2); 
+                    ImPlot::SetAxis(ImAxis_Y2);
                     ImPlot::PlotLine("Voltage", displayData.voltageHistory.data(), displayData.voltageHistory.size());
                     ImPlot::EndPlot();
                 }
@@ -696,7 +895,7 @@ int main(int, char **)
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
-    ImPlot::DestroyContext(); 
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
