@@ -4,7 +4,7 @@ It also can be used in other PCs with UDP.
 
 ### Cloning the Repository
 ```bash
-git clone https://github.com/AustinRover/lb_unitree.git
+git clone https://github.com/AustinRover/lb_unitree.git --recurse-submodules
 ```
 
 ### Connecting to the Go1
