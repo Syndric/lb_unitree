@@ -2,6 +2,16 @@
 The unitree_legged_sdk is mainly used for communication between PC and Controller board.
 It also can be used in other PCs with UDP.
 
+### Cloning the Repository
+```bash
+git clone https://github.com/AustinRover/lb_unitree.git
+```
+
+### Connecting to the Go1
+Before running any examples, you must connect to the Unitree Go1 robot. See the official Trossen Robotics documentation for detailed setup instructions:
+
+[Trossen Robotics - Unitree Go1 Getting Started](https://docs.trossenrobotics.com/unitree_go1_docs/getting_started.html)
+
 ### Notice
 support robot: Go1
 
@@ -48,6 +58,34 @@ sudo apt install libmsgpack*
 #### Cpp
 Run examples with 'sudo' for memory locking.
 
+#### Monitor GUI
+The `monitor_gui` application provides a real-time graphical interface for monitoring the Go1's BMS data, joint torques, and running automated tests.
+
+**Additional Dependencies:**
+* [GLFW](https://www.glfw.org/) (for windowing)
+* [OpenGL](https://www.opengl.org/)
+
+Install on Ubuntu:
+```bash
+sudo apt install libglfw3-dev
+```
+
+**Running the Monitor GUI:**
+```bash
+cd build
+sudo ./monitor_gui
+```
+
+The GUI allows you to:
+- Monitor battery state of charge, voltage, current, and power in real-time
+- View individual cell voltages
+- Monitor estimated joint torques for all 12 joints
+- Run automated test sequences (Neutral, Floor, Squat, Walk & Turn)
+- Log data to CSV files for analysis
+
 #### Python
 ##### arm
 change `sys.path.append('../lib/python/amd64')` to `sys.path.append('../lib/python/arm64')`
+
+### AI Usage Statement
+AI was used to generate all code in `src/monitor_gui.cpp` and `src/monitor.cpp`.
