@@ -1,29 +1,20 @@
 /**********************************************************************
- * Unitree Go1 Power & Battery Monitor GUI
- *
- * This application uses the Unitree Legged SDK to create a
- * real-time GUI dashboard for monitoring power and battery stats.
- *
- * It uses Dear ImGui for the GUI, GLFW for the window,
- * OpenGL for rendering, and ImPlot for plotting.
- *
- * It now uses the SDK's LoopFunc class for communication,
- * matching the structure of the working terminal monitor.
- **********************************************************************/
+ Copyright (c) 2020-2023, Unitree Robotics.Co.Ltd. All rights reserved.
+***********************************************************************/
 
 #include "unitree_legged_sdk/unitree_legged_sdk.h"
+#include <math.h>
 #include <iostream>
 #include <unistd.h>
 #include <string.h>
-// #include <thread>     // No longer using std::thread for comms
-#include <mutex>   // For thread-safe data access
-#include <chrono>  // For time calculations
-#include <vector>  // For plot history
-#include <numeric> // For std::accumulate
-#include <fstream> // For CSV logging
-#include <iomanip> // For std::setprecision
-#include <atomic>  // For std::atomic<bool>
-#include <array>   // For std::array (to hold joint torques)
+#include <mutex>     // For thread-safe data access
+#include <chrono>    // For time calculations
+#include <vector>    // For plot history
+#include <numeric>   // For std::accumulate
+#include <fstream>   // For CSV logging
+#include <iomanip>   // For std::setprecision
+#include <atomic>    // For std::atomic<bool>
+#include <array>     // For std::array (to hold joint torques)
 #include <algorithm> // For std::max
 
 // --- ImGui & Backend Headers ---
@@ -53,6 +44,16 @@ void limit_data_vector(std::vector<float> &vec, size_t max_size)
     }
 }
 
+// Enum for Test Modes
+enum class TestMode
+{
+    NONE,
+    NEUTRAL,
+    FLOOR,
+    SQUAT_REAR_DOWN,
+    WALK_TURN
+};
+
 // Data structure to hold all monitored values
 struct MonitorData
 {
@@ -66,9 +67,15 @@ struct MonitorData
     double totalEnergy_Wh = 0.0;
     double averagePower_W = 0.0;
     double runTime_s = 0.0;
+    std::array<float, 3> position = {0.0f};
+    std::array<float, 3> rpy = {0.0f};
 
     // Joint Torques
     std::array<float, 12> jointTorques;
+
+    // Test Status
+    TestMode currentTest = TestMode::NONE;
+    double testTimeRemaining = 0.0;
 
     // Plotting History (using 500 samples for better ImPlot resolution)
     std::vector<float> socHistory;
@@ -82,17 +89,21 @@ class RobotMonitor
 {
 public:
     RobotMonitor() : safe(LeggedType::Go1),
-                     udp(HIGHLEVEL, 8090, "192.168.12.1", 8082),
+                     udp(HIGHLEVEL, 8090, "192.168.12.1", 8082), // Targeted Go1 IP
                      running(false),
-                     dt(0.002), // 500Hz, matching monitor.cpp
+                     dt(0.002), // 500Hz
                      loop_count(0),
                      loop_udpSend(nullptr),
                      loop_udpRecv(nullptr),
                      loop_control(nullptr),
-                     plotHistorySize(500) // Store 500 samples (1 second at 500Hz)
+                     plotHistorySize(500),
+                     activeTest(TestMode::NONE),
+                     testElapsedTime(0.0)
     {
         udp.InitCmdData(cmd);
         cmd.mode = 0; // Set to idle mode for safety
+        // Default filename
+        strncpy(logFilenameBuffer, "go1_bms_log.csv", sizeof(logFilenameBuffer));
     }
 
     ~RobotMonitor()
@@ -108,7 +119,6 @@ public:
         // Reset data struct
         {
             std::lock_guard<std::mutex> lock(dataMutex);
-            // reset all members manually
             data.bms = {}; // Zero-initialize the BMS struct
             data.totalVoltage_V = 0.0f;
             data.current_A = 0.0f;
@@ -116,7 +126,7 @@ public:
             data.totalEnergy_Wh = 0.0;
             data.averagePower_W = 0.0;
             data.runTime_s = 0.0;
-            data.jointTorques.fill(0.0f); // Explicitly zero the torques
+            data.jointTorques.fill(0.0f);
             data.socHistory.clear();
             data.powerHistory.clear();
             data.voltageHistory.clear();
@@ -125,13 +135,27 @@ public:
             {
                 vec.clear();
             }
+            data.currentTest = TestMode::NONE;
+            data.testTimeRemaining = 0.0;
+            data.position.fill(0.0f);
+            data.rpy.fill(0.0f);
         }
 
-        // Open log file and write header
-        logFile.open("go1_bms_log.csv", std::ios::out | std::ios::trunc);
+        // Open log file and write header using buffer name
+        logFile.open(logFilenameBuffer, std::ios::out | std::ios::trunc);
         if (logFile.is_open())
         {
-            logFile << "Timestamp(ms),Runtime(s),SOC(%),Voltage(V),Current(A),Power(W),TotalEnergy(Wh),";
+            // Write Standard Headers
+            logFile << "Timestamp(ms),Runtime(s),TestMode,SOC(%),Voltage(V),Current(A),Power(W),TotalEnergy(Wh),";
+
+            // Write Torque Headers
+            const char *logJointNames[12] = {"FR_Hip", "FR_Thigh", "FR_Calf", "FL_Hip", "FL_Thigh", "FL_Calf", "RR_Hip", "RR_Thigh", "RR_Calf", "RL_Hip", "RL_Thigh", "RL_Calf"};
+            for (int i = 0; i < 12; ++i)
+            {
+                logFile << logJointNames[i] << "_Tau(Nm),";
+            }
+
+            // Write Cell Voltage Headers
             for (int i = 0; i < 10; ++i)
             {
                 logFile << "Cell" << i + 1 << "(mV)" << (i == 9 ? "\n" : ",");
@@ -139,7 +163,7 @@ public:
         }
         else
         {
-            std::cerr << "Error: Could not open log file!" << std::endl;
+            std::cerr << "Error: Could not open log file: " << logFilenameBuffer << std::endl;
         }
 
         running = true;
@@ -147,10 +171,9 @@ public:
         lastUpdateTime = std::chrono::high_resolution_clock::now();
         loop_count = 0;
 
-        // --- Use LoopFunc, just like monitor.cpp ---
+        // --- Use LoopFunc ---
         loop_udpSend = new LoopFunc("udp_send", dt, 3, boost::bind(&RobotMonitor::UDPSend, this));
         loop_udpRecv = new LoopFunc("udp_recv", dt, 3, boost::bind(&RobotMonitor::UDPRecv, this));
-        // Give the control loop high priority as well to ensure 500Hz execution
         loop_control = new LoopFunc("control_loop", dt, 3, boost::bind(&RobotMonitor::RunMonitorLoop, this));
 
         loop_udpSend->start();
@@ -188,12 +211,22 @@ public:
         }
     }
 
+    void StartTest(TestMode mode)
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        activeTest = mode;
+        testElapsedTime = 0.0;
+        std::cout << "Starting Test Mode: " << (int)mode << std::endl;
+    }
+
     bool IsRunning() const
     {
         return running.load();
     }
 
-    // --- LoopFunc Callbacks (from monitor.cpp) ---
+    char *GetFilenameBuffer() { return logFilenameBuffer; }
+
+    // --- LoopFunc Callbacks ---
 
     void UDPRecv()
     {
@@ -202,31 +235,27 @@ public:
 
     void UDPSend()
     {
-        // We must send commands to keep the connection alive
-        cmd.mode = 0;
+        // NOTE: Removed hardcoded cmd.mode = 0 here to allow ControlLoop to set modes
         udp.Send();
     }
 
-    // This is the main "control" loop, run by LoopFunc
     void RunMonitorLoop()
     {
         if (!running)
-            return; // Check if we should stop
+            return;
 
         udp.GetRecv(state);
         auto now = std::chrono::high_resolution_clock::now();
         double dt_actual = std::chrono::duration<double>(now - lastUpdateTime).count();
 
         if (dt_actual < 0.001)
-        { // Avoid spikes if dt is too small
-            return;
-        }
+            return; // Avoid spikes
 
         lastUpdateTime = now;
 
-        // --- Calculations ---
+        // --- Power Calculations ---
         float voltage = std::accumulate(state.bms.cell_vol.begin(), state.bms.cell_vol.end(), 0) / 1000.0f; // mV to V
-        float current = state.bms.current / 1000.0f;                                                       // mA to A
+        float current = state.bms.current / 1000.0f;                                                        // mA to A
         float power = voltage * current;
 
         double runTime = std::chrono::duration<double>(now - startTime).count();
@@ -238,8 +267,252 @@ public:
             currentTotalEnergy_Wh = data.totalEnergy_Wh;
         }
 
-        double energy_Ws = power * dt_actual;                                     // Energy in Watt-seconds (Joules)
+        double energy_Ws = power * dt_actual;                                 // Energy in Watt-seconds (Joules)
         double totalEnergy_Ws = (currentTotalEnergy_Wh * 3600.0) + energy_Ws; // Convert Wh back to Ws to add
+
+        // --- Test Logic & Robot Control ---
+
+        // Reset command defaults
+        cmd.mode = 0;
+        cmd.gaitType = 0;
+        cmd.speedLevel = 0;
+        cmd.footRaiseHeight = 0;
+        cmd.bodyHeight = 0;
+        cmd.euler = {0, 0, 0};
+        cmd.velocity = {0, 0};
+        cmd.yawSpeed = 0;
+
+        if (activeTest != TestMode::NONE)
+        {
+            testElapsedTime += dt_actual;
+
+            // Check Test Duration (120 seconds)
+            if (testElapsedTime >= 120.0)
+            {
+                activeTest = TestMode::NONE;
+                std::cout << "Test Completed." << std::endl;
+            }
+            else
+            {
+                // Execute Test Logic
+                switch (activeTest)
+                {
+                case TestMode::NEUTRAL:
+                    // Test 1: Neutral / Damping on floor
+                    cmd.mode = 0; // Idle/Damping
+                    break;
+
+                case TestMode::FLOOR:
+                    // Test 1: Neutral / Damping on floor
+                    cmd.mode = 1; // Forced Stand
+                    cmd.bodyHeight = -0.4;
+                    break;
+
+                case TestMode::SQUAT_REAR_DOWN:
+                    // Test 2: Standing then squatting rear to floor
+                    cmd.mode = 1; // Forced Stand
+                    cmd.bodyHeight = -0.4;
+                    cmd.euler[1] = -0.7;
+                    break;
+
+                case TestMode::WALK_TURN:
+                    // 1. Define a variable to hold the initial heading
+                    static float startYaw = 0.0f;
+                    static float targetYaw = 0.0f;
+                    static bool turnInitialized = false;
+
+                    // LATCH LOGIC:
+                    // If this is the first time running this case, save the current yaw.
+                    // Note: You must ensure 'turnInitialized' is reset to false
+                    // externally if you switch modes and come back.
+                    if (!turnInitialized)
+                    {
+                        startYaw = data.rpy[2];
+                        turnInitialized = true;
+                    }
+
+                    // P-Gain: How "snappy" the turn is.
+                    float Kp = 2.0f;
+
+                    double cycleTime = fmod(testElapsedTime, 15.0);
+
+                    // --- PHASE 1: Turn to Start Angle (0.0s - 2.5s) ---
+                    if (cycleTime < 2.5)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 0.0f;
+
+                        // TARGET: The angle we latched at the start
+                        targetYaw = startYaw;
+                        float currentYaw = data.rpy[2];
+
+                        float error = targetYaw - currentYaw;
+
+                        // WRAPPING LOGIC
+                        if (error > M_PI)
+                            error -= 2 * M_PI;
+                        else if (error < -M_PI)
+                            error += 2 * M_PI;
+
+                        float turnSpeed = error * Kp;
+
+                        // Clamp speed
+                        if (turnSpeed > 3.5f)
+                            turnSpeed = 3.5f;
+                        if (turnSpeed < -3.5f)
+                            turnSpeed = -3.5f;
+
+                        cmd.yawSpeed = turnSpeed;
+                    }
+                    // --- PHASE 2: Walk Forward (2.5s - 7.5s) ---
+                    else if (cycleTime < 7.5)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 1.5f;
+                        cmd.yawSpeed = 0.0f;
+                    }
+                    // --- PHASE 3: Turn 180 deg from Start (7.5s - 10.0s) ---
+                    else if (cycleTime < 10)
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 0.0f;
+
+                        // TARGET: Start angle + 180 degrees (PI)
+                        targetYaw = startYaw + (float)M_PI;
+
+                        // Normalize targetYaw to keep it within -PI to PI (optional but good practice)
+                        if (targetYaw > M_PI)
+                            targetYaw -= 2 * M_PI;
+                        else if (targetYaw < -M_PI)
+                            targetYaw += 2 * M_PI;
+
+                        float currentYaw = data.rpy[2];
+                        float error = targetYaw - currentYaw;
+
+                        // WRAPPING LOGIC
+                        if (error > M_PI)
+                            error -= 2 * M_PI;
+                        else if (error < -M_PI)
+                            error += 2 * M_PI;
+
+                        float turnSpeed = error * Kp;
+                        if (turnSpeed > 3.5f)
+                            turnSpeed = 3.5f;
+                        if (turnSpeed < -3.5f)
+                            turnSpeed = -3.5f;
+
+                        cmd.yawSpeed = turnSpeed;
+                    }
+                    // --- PHASE 4: Walk "Forward" (relative to robot nose) (10.0s - 15.0s) ---
+                    else
+                    {
+                        cmd.mode = 2;
+                        cmd.gaitType = 1;
+                        cmd.velocity[0] = 1.5f;
+                        cmd.yawSpeed = 0.0f;
+                    }
+                    break;
+                }
+
+                /*
+                case TestMode::WALK_TURN:
+    cmd.mode = 3; // Target Position Walking
+    cmd.gaitType = 1; // Trot
+
+    // Zero out velocity/yawSpeed to ensure we are purely in Position Mode
+    cmd.velocity[0] = 0.0f;
+    cmd.velocity[1] = 0.0f;
+    cmd.yawSpeed = 0.0f;
+
+    // Define constants
+    const float PI = 3.14159265f;
+    const float WALK_DIST = 2.5f;    // 0.5m/s * 5.0s = 2.5m
+    const float TURN_DURATION = 3.2f;
+    const float CYCLE_DURATION = 10.0f;
+
+    // Calculate cycle state
+    // cycleCount determines if we are going Away (Even) or Returning (Odd)
+    int cycleCount = (int)(testElapsedTime / CYCLE_DURATION);
+    double cycleTime = fmod(testElapsedTime, CYCLE_DURATION);
+
+    // Initialize target variables
+    float targetX = 0.0f;
+    float targetYaw = 0.0f;
+
+    // LOGIC:
+    // Even Cycle (0, 2, 4...): Walk from X=0 to X=2.5, then Turn from Yaw=0 to Yaw=PI
+    // Odd Cycle  (1, 3, 5...): Walk from X=2.5 to X=0, then Turn from Yaw=PI to Yaw=2PI (0)
+
+    if (cycleCount % 2 == 0) {
+        // --- OUTBOUND LEG ---
+        float startYaw = 0.0f;
+
+        if (cycleTime < 5.0) {
+            // Phase 1: Walking Forward (0 -> 2.5m)
+            float progress = cycleTime / 5.0f; // 0.0 to 1.0
+            targetX = 0.0f + (WALK_DIST * progress);
+            targetYaw = startYaw;
+        }
+        else if (cycleTime < (5.0 + TURN_DURATION)) {
+            // Phase 2: Turning 180 (0 -> PI)
+            // We stay at the final X position
+            targetX = WALK_DIST;
+
+            float turnTime = cycleTime - 5.0f;
+            float progress = turnTime / TURN_DURATION;
+            targetYaw = startYaw + (PI * progress);
+        }
+        else {
+            // Phase 3: Pause
+            targetX = WALK_DIST;
+            targetYaw = startYaw + PI;
+        }
+    }
+    else {
+        // --- RETURN LEG ---
+        // We start at X=2.5, Yaw=PI. We walk "Forward" relative to robot,
+        // which decreases X in inertial frame because we are facing backwards.
+
+        float startYaw = PI;
+
+        if (cycleTime < 5.0) {
+            // Phase 1: Walking "Home" (2.5m -> 0)
+            float progress = cycleTime / 5.0f;
+            targetX = WALK_DIST - (WALK_DIST * progress);
+            targetYaw = startYaw;
+        }
+        else if (cycleTime < (5.0 + TURN_DURATION)) {
+            // Phase 2: Turning 180 (PI -> 2PI)
+            targetX = 0.0f;
+
+            float turnTime = cycleTime - 5.0f;
+            float progress = turnTime / TURN_DURATION;
+            targetYaw = startYaw + (PI * progress);
+        }
+        else {
+            // Phase 3: Pause
+            targetX = 0.0f;
+            targetYaw = startYaw + PI; // effectively 2PI aka 0
+        }
+    }
+
+    // Apply Targets
+    cmd.position[0] = targetX;
+    cmd.position[1] = 0.0f; // Assuming straight line on X axis
+
+    // NOTE: The header comment says Mode 3 is "controlled by position + ypr[0]".
+    // Standard Unitree mapping is euler[2] for Yaw.
+    // If the robot does not rotate, try cmd.euler[0] due to the specific header comment.
+    cmd.euler[0] = 0.0f;
+    cmd.euler[1] = 0.0f;
+    cmd.euler[2] = targetYaw;
+
+    break;*/
+            }
+        }
 
         // --- Lock and Update Data ---
         {
@@ -250,6 +523,14 @@ public:
             data.current_A = current;
             data.power_W = power;
             data.runTime_s = runTime;
+            data.currentTest = activeTest;
+            data.position = state.position;
+            data.rpy = state.imu.rpy;
+
+            if (activeTest != TestMode::NONE)
+                data.testTimeRemaining = 120.0 - testElapsedTime;
+            else
+                data.testTimeRemaining = 0.0;
 
             // Copy joint torques
             for (int i = 0; i < 12; ++i)
@@ -261,7 +542,7 @@ public:
             data.totalEnergy_Wh = totalEnergy_Ws / 3600.0; // Convert back to Wh
             data.averagePower_W = (runTime > 0) ? (totalEnergy_Ws / runTime) : 0.0;
 
-            // Update plot history (limit to plotHistorySize samples)
+            // Update plot history
             limit_data_vector(data.socHistory, plotHistorySize);
             limit_data_vector(data.powerHistory, plotHistorySize);
             limit_data_vector(data.voltageHistory, plotHistorySize);
@@ -281,35 +562,40 @@ public:
         }
 
         loop_count++;
-        // Log to file periodically (e.g., 10Hz)
-        // 500Hz / 50 = 10Hz
+
+        // Log to file periodically (every 50 loops ~ 10Hz)
         if (loop_count % 50 == 0 && logFile.is_open())
         {
             auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
             logFile << timestamp << ","
                     << std::fixed << std::setprecision(3) << runTime << ","
+                    << (int)activeTest << "," // Log test mode
                     << (int)state.bms.SOC << ","
                     << voltage << ","
                     << current << ","
                     << power << ","
-                    << std::setprecision(6) << data.totalEnergy_Wh << ",";
+                    << std::setprecision(6) << data.totalEnergy_Wh << ","; // Log Total Wh
 
+            // Log Torques
+            for (int i = 0; i < 12; ++i)
+            {
+                logFile << std::setprecision(3) << state.motorState[i].tauEst << ",";
+            }
+
+            // Log Cells
             for (int i = 0; i < 10; ++i)
             {
                 logFile << state.bms.cell_vol[i] << (i == 9 ? "\n" : ",");
             }
         }
 
-        // SetSend in the control loop, just like monitor.cpp
         udp.SetSend(cmd);
     }
-    // ---------------------------------------------
 
-    // Public method to get a copy of the data safely
     MonitorData GetDisplayData()
     {
         std::lock_guard<std::mutex> lock(dataMutex);
-        return data; // This works, as MonitorData is copyable
+        return data;
     }
 
 private:
@@ -322,6 +608,10 @@ private:
     const size_t plotHistorySize;
 
     std::atomic<bool> running;
+    TestMode activeTest;
+    double testElapsedTime;
+
+    char logFilenameBuffer[128];
 
     MonitorData data;
     std::ofstream logFile;
@@ -330,7 +620,6 @@ private:
     std::chrono::high_resolution_clock::time_point startTime;
     std::chrono::high_resolution_clock::time_point lastUpdateTime;
 
-    // SDK LoopFunc objects
     LoopFunc *loop_udpSend;
     LoopFunc *loop_udpRecv;
     LoopFunc *loop_control;
@@ -345,11 +634,9 @@ static void glfw_error_callback(int error, const char *description)
 // --- Main Application ---
 int main(int, char **)
 {
-    // --- 1. Initialize Robot Monitor ---
     std::cout << "Initializing Robot Monitor..." << std::endl;
     RobotMonitor monitor;
 
-    // --- 2. Initialize GLFW Window ---
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
         return 1;
@@ -358,58 +645,57 @@ int main(int, char **)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow *window = glfwCreateWindow(1024, 768, "Unitree Go1 Power Monitor", NULL, NULL);
+    GLFWwindow *window = glfwCreateWindow(1024, 800, "Unitree Go1 Power Monitor & Test Control", NULL, NULL);
     if (window == NULL)
         return 1;
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // Enable vsync
+    glfwSwapInterval(1);
 
-    // --- 3. Initialize ImGui ---
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImPlot::CreateContext(); // Create ImPlot context
+    ImPlot::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     (void)io;
     ImGui::StyleColorsDark();
 
-    // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    // Joint names for display
     const char *jointNames[12] = {
         "FR_Hip  ", "FR_Thigh", "FR_Calf ",
         "FL_Hip  ", "FL_Thigh", "FL_Calf ",
         "RR_Hip  ", "RR_Thigh", "RR_Calf ",
         "RL_Hip  ", "RL_Thigh", "RL_Calf "};
 
-    // --- 4. Main GUI Loop ---
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
 
-        // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Get a thread-safe copy of the data
         MonitorData displayData = monitor.GetDisplayData();
 
-        // Set the main window to fill the whole screen
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-        ImGui::Text("UNITREE GO1 POWER MONITOR (ImPlot Version)");
+        ImGui::Text("UNITREE GO1 MONITOR & TEST SUITE");
         ImGui::Separator();
+
+        // --- CONFIGURATION ---
+        if (!monitor.IsRunning())
+        {
+            ImGui::Text("Configuration:");
+            ImGui::InputText("Log Filename", monitor.GetFilenameBuffer(), 128);
+        }
 
         // --- START/STOP BUTTONS ---
         if (monitor.IsRunning())
         {
-            // Make button red when running
             ImGui::PushStyleColor(ImGuiCol_Button, (ImVec4)ImColor::HSV(0.0f, 0.6f, 0.6f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, (ImVec4)ImColor::HSV(0.0f, 0.7f, 0.7f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, (ImVec4)ImColor::HSV(0.0f, 0.8f, 0.8f));
@@ -421,7 +707,6 @@ int main(int, char **)
         }
         else
         {
-            // Make button green when stopped
             ImGui::PushStyleColor(ImGuiCol_Button, (ImVec4)ImColor::HSV(0.3f, 0.6f, 0.6f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, (ImVec4)ImColor::HSV(0.3f, 0.7f, 0.7f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, (ImVec4)ImColor::HSV(0.3f, 0.8f, 0.8f));
@@ -433,42 +718,89 @@ int main(int, char **)
         }
         ImGui::Separator();
 
+        // --- AUTOMATED TESTS ---
+        if (monitor.IsRunning())
+        {
+            ImGui::Text("AUTOMATED TESTS (120s Duration)");
+            if (displayData.currentTest == TestMode::NONE)
+            {
+                if (ImGui::Button("Test 0: Neutral", ImVec2(180, 40)))
+                {
+                    monitor.StartTest(TestMode::NEUTRAL);
+                }
+                if (ImGui::Button("Test 1: Floor", ImVec2(180, 40)))
+                {
+                    monitor.StartTest(TestMode::FLOOR);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Test 2: Squat (Rear Down)", ImVec2(180, 40)))
+                {
+                    monitor.StartTest(TestMode::SQUAT_REAR_DOWN);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Test 3: Walk & Turn", ImVec2(180, 40)))
+                {
+                    monitor.StartTest(TestMode::WALK_TURN);
+                }
+            }
+            else
+            {
+                // Show Progress
+                const char *testNames[] = {"None", "Neutral/Floor", "Squat", "Walk & Turn"};
+                ImGui::TextColored(ImVec4(1, 1, 0, 1), "RUNNING TEST: %s", testNames[(int)displayData.currentTest]);
+
+                float fraction = (float)((120.0 - displayData.testTimeRemaining) / 120.0);
+                char buf[32];
+                sprintf(buf, "%.1f s Remaining", displayData.testTimeRemaining);
+                ImGui::ProgressBar(fraction, ImVec2(-1, 0.0f), buf);
+
+                if (ImGui::Button("ABORT TEST", ImVec2(-1, 0)))
+                {
+                    monitor.StartTest(TestMode::NONE);
+                }
+            }
+            ImGui::Separator();
+        }
+
         // --- DATA DISPLAY ---
         if (!monitor.IsRunning())
         {
-            ImGui::Text("Monitoring is stopped. Press 'Start' to begin.");
-            ImGui::Text("Log file 'go1_bms_log.csv' will be created/overwritten.");
+            ImGui::Text("Monitoring is stopped. Configure filename and press 'Start' to begin.");
         }
         else if (displayData.runTime_s < 0.5)
-        { // Give a bit more time to connect
+        {
             ImGui::Text("Connecting to robot... (Runtime: %.2f s)", displayData.runTime_s);
         }
         else
         {
             // --- Stats Window ---
             ImGui::BeginChild("Stats", ImVec2(ImGui::GetContentRegionAvail().x * 0.4f, 0), true);
-            ImGui::Text("STATUS (Runtime: %.2f s)", displayData.runTime_s);
+
+            ImGui::Text("STATUS");
+            ImGui::Text("Runtime:      %.2f s", displayData.runTime_s);
+            ImGui::Text("Amperage:     %.4f A", (displayData.bms.current / 1000.0f));
+            ImGui::Text("Total Energy: %.4f Wh", displayData.totalEnergy_Wh);
+
             ImGui::Separator();
-            ImGui::Text("SOC:        %d %%", (int)displayData.bms.SOC);
-            ImGui::BeginChild("Cells", ImVec2(0, 150), false, ImGuiWindowFlags_HorizontalScrollbar); // Give cells a fixed height
+            ImGui::Text("SOC:         %d %%", (int)displayData.bms.SOC);
+            ImGui::BeginChild("Cells", ImVec2(0, 150), false, ImGuiWindowFlags_HorizontalScrollbar);
             for (int i = 0; i < 10; i++)
             {
                 ImGui::Text("Cell %2d: %d mV", i + 1, displayData.bms.cell_vol[i]);
             }
-            ImGui::EndChild(); // End Cells
+            ImGui::EndChild();
 
             ImGui::Separator();
             ImGui::Text("Joint Torques (Est. Nm):");
             ImGui::BeginChild("Torques", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false, ImGuiWindowFlags_HorizontalScrollbar);
             for (int i = 0; i < 12; i++)
             {
-                // Display in a 3-column layout for readability
                 if (i % 3 != 0)
                     ImGui::SameLine(150.0f * (i % 3));
 
                 ImGui::Text("%s: %5.2f", jointNames[i], displayData.jointTorques[i]);
             }
-            ImGui::EndChild(); // End Torques
+            ImGui::EndChild();
 
             ImGui::EndChild(); // End Stats
 
@@ -480,76 +812,58 @@ int main(int, char **)
 
             if (!displayData.socHistory.empty())
             {
-                // --- Create temporary, inverted data for plotting ---
-                // (Usage/Discharge = Positive value)
                 std::vector<float> absPowerHistory(displayData.powerHistory.size());
                 std::vector<float> absCurrentHistory(displayData.currentHistory.size());
                 for (size_t i = 0; i < displayData.powerHistory.size(); ++i)
                 {
-                    absPowerHistory[i] = -displayData.powerHistory[i]; // E.g., -50W becomes 50W
+                    absPowerHistory[i] = -displayData.powerHistory[i];
                 }
                 for (size_t i = 0; i < displayData.currentHistory.size(); ++i)
                 {
-                    absCurrentHistory[i] = -displayData.currentHistory[i]; // E.g., -5A becomes 5A
+                    absCurrentHistory[i] = -displayData.currentHistory[i];
                 }
 
-                // --- Plot 1: SOC & Voltage (Dual Y-Axis) ---
-                // Use ImVec2(-1, ...) to fill the width.
                 // Calculate height for 3 plots
                 float plotHeight = (ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y * 2.0f) / 3.0f;
-                plotHeight = std::max(plotHeight, 50.0f); // Ensure a minimum height
+                plotHeight = std::max(plotHeight, 50.0f);
 
+                // --- Plot 1: SOC & Voltage ---
                 if (ImPlot::BeginPlot("SOC & Voltage", ImVec2(-1, plotHeight)))
                 {
-                    // --- Setup ALL axes first ---
-                    // Y-Axis 1 (Left) for SOC
                     ImPlot::SetupAxis(ImAxis_Y1, "SOC (%)", ImPlotAxisFlags_None);
                     ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 100, ImPlotCond_Always);
-
-                    // Y-Axis 2 (Right) for Voltage
                     ImPlot::SetupAxis(ImAxis_Y2, "Voltage (V)", ImPlotAxisFlags_Opposite);
-                    ImPlot::SetupAxisLimits(ImAxis_Y2, 18.0, 26.0, ImPlotCond_Always); // Go1 6S battery
+                    ImPlot::SetupAxisLimits(ImAxis_Y2, 18.0, 26.0, ImPlotCond_Always);
 
-                    // --- Then plot data ---
                     ImPlot::PlotLine("SOC", displayData.socHistory.data(), displayData.socHistory.size());
-
-                    ImPlot::SetAxis(ImAxis_Y2); // Activate Y2
+                    ImPlot::SetAxis(ImAxis_Y2);
                     ImPlot::PlotLine("Voltage", displayData.voltageHistory.data(), displayData.voltageHistory.size());
-
                     ImPlot::EndPlot();
                 }
 
-                // --- Plot 2: Power & Current (Dual Y-Axis) ---
+                // --- Plot 2: Power & Current ---
                 if (ImPlot::BeginPlot("Power & Current (Usage)", ImVec2(-1, plotHeight)))
                 {
-                    // --- Setup ALL axes first ---
-                    // Y-Axis 1 (Left) for Power
                     ImPlot::SetupAxis(ImAxis_Y1, "Power (W)", ImPlotAxisFlags_None);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 500, ImPlotCond_Always); // 0 to 500W
-
-                    // Y-Axis 2 (Right) for Current
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 500, ImPlotCond_Always);
                     ImPlot::SetupAxis(ImAxis_Y2, "Current (A)", ImPlotAxisFlags_Opposite);
-                    ImPlot::SetupAxisLimits(ImAxis_Y2, 0, 20, ImPlotCond_Always); // 0 to 20A
+                    ImPlot::SetupAxisLimits(ImAxis_Y2, 0, 20, ImPlotCond_Always);
 
-                    // --- Then plot data ---
                     ImPlot::PlotLine("Power", absPowerHistory.data(), absPowerHistory.size());
-
-                    ImPlot::SetAxis(ImAxis_Y2); // Activate Y2
+                    ImPlot::SetAxis(ImAxis_Y2);
                     ImPlot::PlotLine("Current", absCurrentHistory.data(), absCurrentHistory.size());
-
                     ImPlot::EndPlot();
                 }
 
                 // --- Plot 3: Joint Torques ---
                 if (ImPlot::BeginPlot("Joint Torques (Est. Nm)", ImVec2(-1, plotHeight)))
                 {
-                    ImPlot::SetupLegend(ImPlotLocation_East, ImPlotLegendFlags_Outside); // Add a legend
+                    ImPlot::SetupLegend(ImPlotLocation_East, ImPlotLegendFlags_Outside);
                     ImPlot::SetupAxis(ImAxis_Y1, "Torque (Nm)", ImPlotAxisFlags_None);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, -30, 30, ImPlotCond_Always); // Typical Go1 torque limits
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, -30, 30, ImPlotCond_Always);
 
                     for (int i = 0; i < 12; ++i)
                     {
-                        // Check if history has data to avoid plotting empty vectors
                         if (!displayData.jointTorqueHistory[i].empty())
                         {
                             ImPlot::PlotLine(jointNames[i], displayData.jointTorqueHistory[i].data(), displayData.jointTorqueHistory[i].size());
@@ -564,7 +878,6 @@ int main(int, char **)
 
         ImGui::End(); // End Main
 
-        // --- 5. Rendering ---
         ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
@@ -576,14 +889,13 @@ int main(int, char **)
         glfwSwapBuffers(window);
     }
 
-    // --- 6. Cleanup ---
     std::cout << "Stopping robot monitor thread..." << std::endl;
     monitor.StopMonitoring();
     std::cout << "Cleaning up GUI..." << std::endl;
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
-    ImPlot::DestroyContext(); // Destroy ImPlot context
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window);
